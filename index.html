@@ -1,0 +1,539 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>너구리 대모험</title>
+<link href="https://fonts.googleapis.com/css2?family=Press+Start+2P&display=swap" rel="stylesheet">
+<style>
+  :root { --bg:#0b0614; --frame1:#2a1b5c; --frame2:#120a2e; --neon:#ff3fa4; --neon2:#3fe0ff; }
+  * { box-sizing:border-box; }
+  html,body { margin:0; height:100%; background:var(--bg); color:#fff; font-family:"Press Start 2P", monospace; }
+  body { display:flex; flex-direction:column; align-items:center; justify-content:center; gap:14px; padding:16px; overflow-x:hidden;
+         background: radial-gradient(ellipse at center, #1d1040 0%, #0b0614 70%); }
+  .marquee { font-size:clamp(14px,3.4vw,26px); letter-spacing:3px; color:#ffe94a;
+             text-shadow:0 0 6px #ff9a1a, 0 0 18px #ff3fa4, 3px 3px 0 #b0200a; text-align:center; }
+  .cabinet { padding:14px; border-radius:14px;
+             background:linear-gradient(145deg,var(--frame1),var(--frame2));
+             box-shadow:0 0 0 3px #000, 0 0 0 6px var(--neon), 0 0 30px var(--neon), inset 0 0 20px #000; }
+  .screen { position:relative; width:min(92vw, 768px); aspect-ratio:256/240; background:#000; border-radius:6px; overflow:hidden; }
+  canvas { width:100%; height:100%; display:block; image-rendering:pixelated; image-rendering:crisp-edges; }
+  .screen::after { content:""; position:absolute; inset:0; pointer-events:none;
+    background:repeating-linear-gradient(to bottom, rgba(0,0,0,.28) 0px, rgba(0,0,0,.28) 1px, transparent 2px, transparent 3px);
+    box-shadow:inset 0 0 60px rgba(0,0,0,.8); }
+  .help { font-size:clamp(7px,1.6vw,10px); color:#9fb8ff; text-align:center; line-height:1.9; }
+  .help b { color:var(--neon2); font-weight:normal; }
+  #pad { display:none; width:min(92vw,520px); justify-content:space-between; align-items:center; user-select:none; -webkit-user-select:none; touch-action:none; }
+  #pad .dpad { display:grid; grid-template-columns:repeat(3,56px); grid-template-rows:repeat(3,56px); gap:4px; }
+  #pad button { font-family:inherit; font-size:14px; color:#fff; background:#2a1b5c; border:2px solid var(--neon2); border-radius:10px; touch-action:none; }
+  #pad button:active { background:var(--neon); }
+  #pad .jump { width:96px; height:96px; border-radius:50%; border-color:var(--neon); font-size:11px; }
+  @media (pointer:coarse) { #pad { display:flex; } .help { display:none; } }
+</style>
+</head>
+<body>
+<div class="marquee">★ 너구리 대모험 ★</div>
+<div class="cabinet"><div class="screen"><canvas id="game" width="256" height="240"></canvas></div></div>
+<div class="help">
+  <b>← →</b> 이동   <b>↑ ↓</b> 사다리   <b>SPACE</b> 점프   <b>M</b> 음악   <b>P</b> 일시정지<br>
+  과일을 모두 먹으면 스테이지 클리어! 뱀과 압정을 피하세요.
+</div>
+<div id="pad">
+  <div class="dpad">
+    <span></span><button data-k="ArrowUp">▲</button><span></span>
+    <button data-k="ArrowLeft">◀</button><span></span><button data-k="ArrowRight">▶</button>
+    <span></span><button data-k="ArrowDown">▼</button><span></span>
+  </div>
+  <button class="jump" data-k="Space">JUMP</button>
+</div>
+
+<script>
+(() => {
+const C = document.getElementById('game'), X = C.getContext('2d');
+X.imageSmoothingEnabled = false;
+const W = 256, H = 240;
+const FY = [216, 176, 136, 96, 56];          // floor surfaces, 0 = bottom
+const TMAX = 60 * 60;                         // 60 seconds per stage
+const GR = 0.18;
+
+/* ---------------- input ---------------- */
+const keys = {};
+let jumpReq = false, paused = false;
+const L = () => keys.ArrowLeft || keys.KeyA, R = () => keys.ArrowRight || keys.KeyD;
+const U = () => keys.ArrowUp || keys.KeyW,   D = () => keys.ArrowDown || keys.KeyS;
+addEventListener('keydown', e => {
+  if (['ArrowLeft','ArrowRight','ArrowUp','ArrowDown','Space'].includes(e.code)) e.preventDefault();
+  if (!e.repeat) onPress(e.code);
+  keys[e.code] = true;
+});
+addEventListener('keyup', e => { keys[e.code] = false; });
+document.querySelectorAll('#pad button').forEach(b => {
+  const k = b.dataset.k;
+  const on = e => { e.preventDefault(); keys[k] = true; onPress(k); };
+  const off = e => { e.preventDefault(); keys[k] = false; };
+  b.addEventListener('pointerdown', on);
+  ['pointerup','pointerleave','pointercancel'].forEach(t => b.addEventListener(t, off));
+});
+C.addEventListener('pointerdown', () => onPress('Enter'));
+
+function onPress(code) {
+  ensureAudio();
+  if (code === 'KeyM') { musicOn = !musicOn; return; }
+  if ((mode === 'title' || (mode === 'over' && t === 0)) && (code === 'Space' || code === 'Enter')) { startGame(); return; }
+  if (mode === 'play') {
+    if (code === 'KeyP') { paused = !paused; return; }
+    if (code === 'Space' && !paused) jumpReq = true;
+  }
+}
+
+/* ---------------- audio ---------------- */
+let AC = null, musicOn = true;
+function ensureAudio() {
+  if (!AC) { try { AC = new (window.AudioContext || window.webkitAudioContext)(); } catch (e) {} }
+  if (AC && AC.state === 'suspended') AC.resume();
+}
+const mf = n => 440 * Math.pow(2, (n - 69) / 12);
+function tone(f, d, type = 'square', v = 0.06, f2) {
+  if (!AC) return;
+  const o = AC.createOscillator(), g = AC.createGain(), t0 = AC.currentTime;
+  o.type = type; o.frequency.setValueAtTime(f, t0);
+  if (f2) o.frequency.exponentialRampToValueAtTime(f2, t0 + d);
+  g.gain.setValueAtTime(v, t0); g.gain.exponentialRampToValueAtTime(0.001, t0 + d);
+  o.connect(g).connect(AC.destination); o.start(t0); o.stop(t0 + d + 0.02);
+}
+const seq = (notes, gap, type = 'square', v = 0.06, d = 0.12) =>
+  notes.forEach((n, i) => setTimeout(() => tone(mf(n), d, type, v), i * gap));
+const SFX = {
+  jump:   () => tone(300, 0.18, 'square', 0.05, 720),
+  eat:    () => { tone(880, 0.06); setTimeout(() => tone(1320, 0.09), 60); },
+  pot:    () => seq([72, 76, 79, 84, 88], 50),
+  die:    () => tone(700, 0.9, 'sawtooth', 0.08, 70),
+  clear:  () => seq([72, 76, 79, 84, 79, 84, 88], 110, 'square', 0.07, 0.16),
+  oneup:  () => seq([84, 88, 91, 96], 70),
+  start:  () => seq([60, 64, 67, 72, 67, 72, 76], 100, 'square', 0.06, 0.14),
+  over:   () => seq([67, 64, 60, 55, 48], 220, 'triangle', 0.09, 0.3),
+};
+// original bouncy loop
+const MEL = [72,0,76,79, 76,0,74,72, 69,0,72,74, 72,0,67,0, 72,0,76,79, 81,79,76,74, 72,74,76,74, 72,0,0,0];
+const BAS = [48,0,55,0, 48,0,55,0, 45,0,52,0, 45,0,52,0, 48,0,55,0, 53,0,57,0, 55,0,50,0, 48,0,43,0];
+let mStep = 0;
+setInterval(() => {
+  if (!AC || !musicOn || mode !== 'play' || paused) return;
+  const m = MEL[mStep % MEL.length], b = BAS[mStep % BAS.length];
+  if (m) tone(mf(m), 0.11, 'square', 0.03);
+  if (b) tone(mf(b), 0.13, 'triangle', 0.07);
+  mStep++;
+}, 140);
+
+/* ---------------- sprites ---------------- */
+const RAC_TOP = [
+  "..kk......kk..",
+  ".kbbk....kbbk.",
+  ".kbbbbbbbbbbk.",
+  "kbwwwbbbbwwwbk",
+  "kkkkwwbbwwkkkk",
+  "kkwkkwwwwkkwkk",
+  ".kkwwwkkwwwkk.",
+  "..kwwwwwwwwk..",
+  "...kkbbbbkk...",
+  "..kbbttttbbk..",
+  ".kbbttttttbbk.",
+  ".kbbttttttbbk.",
+  "..kbbttttbbk..",
+  "...kbbbbbbk...",
+];
+const RAC_A = RAC_TOP.concat(["..kkk....kkk..", "..kkk....kkk.."]);
+const RAC_B = RAC_TOP.concat(["...kkk..kkk...", "....kk..kk...."]);
+const RAC_PAL = { k:'#1a1a1a', b:'#b0682c', t:'#f4cf98', w:'#ffffff' };
+
+const SNK_A = [
+  "..........gggg..",
+  ".........ggkggg.",
+  "..........ggggrr",
+  "..gg.....gg.....",
+  ".gyyg...gg......",
+  "gg..gg.gg.......",
+  "g....ggg........",
+];
+const SNK_B = [
+  "..........gggg..",
+  ".........ggkggg.",
+  "..........gggg.r",
+  ".........gg.....",
+  "gg..gg..gg......",
+  ".gyyg.ggg.......",
+  "..gg............",
+];
+const SNK_PAL = { g:'#44dd44', k:'#000', r:'#ff3030', y:'#ffe040' };
+
+function spr(rows, pal, x, y, flip, vflip) {
+  x = Math.round(x); y = Math.round(y);
+  const h = rows.length;
+  for (let j = 0; j < h; j++) {
+    const r = rows[vflip ? h - 1 - j : j];
+    for (let i = 0; i < r.length; i++) {
+      const c = r[i]; if (c === '.') continue;
+      X.fillStyle = pal[c];
+      X.fillRect(flip ? x + r.length - 1 - i : x + i, y + j, 1, 1);
+    }
+  }
+}
+function disc(cx, cy, r, col) {
+  X.fillStyle = col;
+  for (let dy = -r; dy <= r; dy++) for (let dx = -r; dx <= r; dx++)
+    if (dx * dx + dy * dy <= r * r + r * 0.8) X.fillRect(cx + dx, cy + dy, 1, 1);
+}
+
+const FRUITS = [
+  { n:'cherry', c:'#ff2040' }, { n:'apple', c:'#ff3a1a' }, { n:'orange', c:'#ff9a10' },
+  { n:'grape',  c:'#a040ff' }, { n:'melon', c:'#40e060' }, { n:'peach',  c:'#ffa0b0' },
+];
+function drawFruit(type, x, y) {
+  x = Math.round(x); y = Math.round(y);
+  const F = FRUITS[type];
+  if (F.n === 'cherry') {
+    X.fillStyle = '#40c040';
+    X.fillRect(x, y - 6, 1, 2); X.fillRect(x - 1, y - 4, 1, 2); X.fillRect(x + 1, y - 4, 1, 2);
+    X.fillRect(x - 2, y - 2, 1, 1); X.fillRect(x + 2, y - 2, 1, 1); X.fillRect(x + 1, y - 6, 2, 1);
+    disc(x - 3, y + 1, 2, F.c); disc(x + 3, y + 1, 2, F.c);
+    X.fillStyle = '#fff'; X.fillRect(x - 4, y, 1, 1); X.fillRect(x + 2, y, 1, 1);
+  } else if (F.n === 'grape') {
+    [[-2,-1],[2,-1],[0,-1],[-1,1],[1,1],[0,3]].forEach(([dx,dy]) => disc(x + dx, y + dy, 1, F.c));
+    X.fillStyle = '#6b3a1a'; X.fillRect(x, y - 4, 1, 2);
+    X.fillStyle = '#40c040'; X.fillRect(x + 1, y - 4, 2, 1);
+  } else {
+    disc(x, y, 3, F.c);
+    if (F.n === 'melon') { X.fillStyle = '#1a8a2a'; X.fillRect(x - 1, y - 3, 1, 7); X.fillRect(x + 1, y - 3, 1, 7); }
+    X.fillStyle = '#6b3a1a'; X.fillRect(x, y - 5, 1, 2);
+    X.fillStyle = '#40c040'; X.fillRect(x + 1, y - 5, 2, 1);
+    X.fillStyle = '#fff'; X.fillRect(x - 2, y - 1, 1, 1);
+  }
+}
+function drawPot(x, y) {
+  x = Math.round(x); y = Math.round(y);
+  disc(x, y - 4, 4, '#c07a3a');
+  X.fillStyle = '#8a4a1a'; X.fillRect(x - 2, y - 10, 5, 2); X.fillRect(x - 4, y - 4, 9, 1);
+  X.fillStyle = '#ffd070'; X.fillRect(x - 3, y - 7, 1, 2);
+}
+function drawSpike(x, y) {
+  X.fillStyle = '#d8d8f0';
+  X.fillRect(x - 3, y - 2, 7, 2); X.fillRect(x - 2, y - 3, 5, 1);
+  X.fillRect(x - 1, y - 4, 3, 1); X.fillRect(x, y - 6, 1, 2);
+  X.fillStyle = '#7070a0'; X.fillRect(x - 3, y - 1, 7, 1);
+}
+function drawRaccoon(x, y, dir, frame, opts = {}) {
+  x = Math.round(x); y = Math.round(y);
+  if (!opts.noTail) {
+    for (let k = 0; k < 4; k++) {
+      X.fillStyle = k % 2 ? '#1a1a1a' : '#b0682c';
+      const ty = y - 7 - k;
+      X.fillRect(dir > 0 ? x - 9 - k * 2 : x + 6 + k * 2, ty, 3, 3);
+    }
+  }
+  spr(frame ? RAC_B : RAC_A, RAC_PAL, x - 7, y - 16, dir < 0, opts.vflip);
+}
+
+/* ---------------- text ---------------- */
+function txt(s, x, y, col, align = 'left', size = 8) {
+  X.font = size + 'px "Press Start 2P", monospace';
+  X.textAlign = align; X.textBaseline = 'top';
+  X.fillStyle = '#000'; X.fillText(s, x + 1, y + 1);
+  X.fillStyle = col; X.fillText(s, x, y);
+}
+
+/* ---------------- game state ---------------- */
+let mode = 'title', t = 0, frame = 0;
+let score = 0, hi = 0, lives = 3, level = 1, nextExtra = 10000, timeLeft = TMAX;
+let ladders = [], spikes = [], fruits = [], pot = null, snakesInit = [], snakes = [], popups = [];
+let P = null;
+try { hi = +localStorage.getItem('neoguri_hi') || 0; } catch (e) {}
+const STARS = Array.from({ length: 60 }, () => [Math.random() * W, 30 + Math.random() * 190, Math.random()]);
+
+const rnd = (a, b) => a + Math.random() * (b - a);
+function genLevel(lv) {
+  ladders = [];
+  for (let i = 0; i < 4; i++) {
+    const xs = [];
+    while (xs.length < 2) {
+      const x = 24 + 8 * Math.floor(Math.random() * 27);
+      if (xs.every(v => Math.abs(v - x) > 56)) xs.push(x);
+    }
+    xs.forEach(x => ladders.push({ x, bot: i, top: i + 1 }));
+  }
+  const nearL = (f, x, d) => ladders.some(l => (l.bot === f || l.top === f) && Math.abs(l.x - x) < d);
+
+  spikes = [];
+  const ns = Math.min(1 + Math.floor(lv / 2), 3);
+  for (let f = 0; f < 5; f++) {
+    let c = 0, tries = 0;
+    while (c < ns && tries++ < 300) {
+      const x = Math.round(rnd(20, 236));
+      if (f === 0 && x < 64) continue;
+      if (nearL(f, x, 18)) continue;
+      if (spikes.some(s => s.f === f && Math.abs(s.x - x) < 46)) continue;
+      spikes.push({ f, x }); c++;
+    }
+  }
+  fruits = [];
+  let tries = 0;
+  while (fruits.length < 8 && tries++ < 2000) {
+    const f = Math.floor(Math.random() * 5), x = Math.round(rnd(20, 236));
+    if (f === 0 && x < 44) continue;
+    if (spikes.some(s => s.f === f && Math.abs(s.x - x) < 16)) continue;
+    if (fruits.some(o => o.f === f && Math.abs(o.x - x) < 22)) continue;
+    fruits.push({ f, x, got: false, type: (lv - 1) % FRUITS.length, ph: Math.random() * 6 });
+  }
+  pot = null; tries = 0;
+  while (!pot && tries++ < 500) {
+    const f = 1 + Math.floor(Math.random() * 4), x = Math.round(rnd(24, 232));
+    if (spikes.some(s => s.f === f && Math.abs(s.x - x) < 16)) continue;
+    if (fruits.some(o => o.f === f && Math.abs(o.x - x) < 16)) continue;
+    if (nearL(f, x, 12)) continue;
+    pot = { f, x, got: false };
+  }
+  snakesInit = [];
+  const nsn = Math.min(1 + lv, 6), sp = Math.min(0.45 + lv * 0.08, 1.3);
+  for (let i = 0; i < nsn; i++) {
+    const f = lv >= 3 ? Math.floor(Math.random() * 5) : 1 + Math.floor(Math.random() * 4);
+    const x = f === 0 ? rnd(150, 226) : rnd(30, 226);
+    snakesInit.push({ f, x, vx: (Math.random() < 0.5 ? -1 : 1) * sp });
+  }
+}
+function resetPositions() {
+  P = { x: 20, y: FY[0], f: 0, dir: 1, air: false, vx: 0, vy: 0, climb: null, anim: 0 };
+  snakes = snakesInit.map(s => ({ ...s, anim: 0 }));
+}
+function startGame() {
+  score = 0; lives = 3; level = 1; nextExtra = 10000;
+  SFX.start(); startLevel();
+}
+function startLevel() {
+  genLevel(level); resetPositions(); timeLeft = TMAX; popups = [];
+  mode = 'ready'; t = 120; mStep = 0; paused = false;
+}
+function addScore(n) {
+  score += n;
+  if (score >= nextExtra) { lives++; nextExtra += 10000; SFX.oneup(); popups.push({ x: P.x, y: P.y - 24, s: '1UP!', t: 60, c: '#3fe0ff' }); }
+  if (score > hi) hi = score;
+}
+function saveHi() { try { localStorage.setItem('neoguri_hi', hi); } catch (e) {} }
+function die() {
+  if (mode !== 'play') return;
+  mode = 'dying'; t = 110; SFX.die();
+}
+
+/* ---------------- update ---------------- */
+function updPlayer() {
+  const p = P;
+  if (p.climb) {
+    const lad = p.climb;
+    if (U()) { p.y -= 0.9; p.anim++; if (p.y <= FY[lad.top]) { p.y = FY[lad.top]; p.f = lad.top; p.climb = null; } }
+    else if (D()) { p.y += 0.9; p.anim++; if (p.y >= FY[lad.bot]) { p.y = FY[lad.bot]; p.f = lad.bot; p.climb = null; } }
+    return;
+  }
+  if (p.air) {
+    p.x += p.vx; p.vy += GR; p.y += p.vy;
+    p.x = Math.max(14, Math.min(242, p.x));
+    if (p.vy > 0 && p.y >= FY[p.f]) { p.y = FY[p.f]; p.air = false; }
+    return;
+  }
+  if (jumpReq) {
+    p.air = true; p.vy = -3.0; p.vx = L() ? -1.2 : R() ? 1.2 : 0;
+    if (p.vx) p.dir = Math.sign(p.vx);
+    SFX.jump(); return;
+  }
+  if (U()) {
+    const lad = ladders.find(l => l.bot === p.f && Math.abs(l.x - p.x) < 6);
+    if (lad) { p.climb = lad; p.x = lad.x; p.y -= 1; return; }
+  }
+  if (D()) {
+    const lad = ladders.find(l => l.top === p.f && Math.abs(l.x - p.x) < 6);
+    if (lad) { p.climb = lad; p.x = lad.x; p.y += 1; return; }
+  }
+  const mv = L() ? -1 : R() ? 1 : 0;
+  if (mv) { p.x += mv * 1.25; p.dir = mv; p.anim++; }
+  p.x = Math.max(14, Math.min(242, p.x));
+}
+function updSnakes() {
+  for (const s of snakes) {
+    s.x += s.vx; s.anim++;
+    if (s.x < 14) { s.x = 14; s.vx = -s.vx; }
+    if (s.x > 242) { s.x = 242; s.vx = -s.vx; }
+    if (Math.random() < 0.004) s.vx = -s.vx;
+  }
+}
+function checks() {
+  const px0 = P.x - 4, px1 = P.x + 4, py0 = P.y - 14, py1 = P.y;
+  for (const s of spikes) {
+    const fy = FY[s.f];
+    if (px1 > s.x - 3 && px0 < s.x + 3 && py1 > fy - 5 && py0 < fy) { die(); return; }
+  }
+  for (const s of snakes) {
+    const fy = FY[s.f];
+    if (px1 > s.x - 6 && px0 < s.x + 6 && py1 > fy - 6 && py0 < fy) { die(); return; }
+  }
+  for (const f of fruits) {
+    if (f.got) continue;
+    const fy = FY[f.f] - 10;
+    if (Math.abs(P.x - f.x) < 8 && py0 < fy + 4 && py1 > fy - 4) {
+      f.got = true; const pts = 100 + 50 * (level - 1);
+      addScore(pts); SFX.eat();
+      popups.push({ x: f.x, y: fy - 6, s: '' + pts, t: 45, c: '#ffe94a' });
+    }
+  }
+  if (pot && !pot.got) {
+    const fy = FY[pot.f] - 5;
+    if (Math.abs(P.x - pot.x) < 8 && py0 < fy + 4 && py1 > fy - 4) {
+      pot.got = true; const pts = 500 * level;
+      addScore(pts); SFX.pot();
+      popups.push({ x: pot.x, y: fy - 10, s: '' + pts, t: 60, c: '#ff3fa4' });
+    }
+  }
+  if (fruits.every(f => f.got)) { mode = 'clear'; t = 100; SFX.clear(); }
+}
+function update() {
+  frame++;
+  switch (mode) {
+    case 'ready': if (--t <= 0) mode = 'play'; break;
+    case 'play':
+      if (paused) break;
+      updPlayer(); updSnakes(); checks();
+      if (mode === 'play' && --timeLeft <= 0) { timeLeft = 0; die(); }
+      break;
+    case 'dying':
+      if (--t <= 0) {
+        lives--;
+        if (lives <= 0) { mode = 'over'; t = 180; saveHi(); SFX.over(); }
+        else { resetPositions(); timeLeft = TMAX; mode = 'ready'; t = 90; }
+      }
+      break;
+    case 'clear':
+      if (timeLeft > 0) {
+        const d = Math.min(30, timeLeft); timeLeft -= d; addScore(50);
+        if (frame % 4 === 0) tone(1400, 0.03, 'square', 0.03);
+      } else if (--t <= 0) { level++; saveHi(); startLevel(); }
+      break;
+    case 'over': if (t > 0) t--; break;
+  }
+  popups.forEach(p => { p.t--; p.y -= 0.4; });
+  popups = popups.filter(p => p.t > 0);
+  jumpReq = false;
+}
+
+/* ---------------- draw ---------------- */
+function drawBackdrop() {
+  X.fillStyle = '#000'; X.fillRect(0, 0, W, H);
+  for (const [x, y, b] of STARS) {
+    const tw = (Math.sin(frame * 0.05 + b * 20) + 1) / 2;
+    X.fillStyle = `rgba(160,180,255,${0.15 + 0.35 * tw * b})`;
+    X.fillRect(x | 0, y | 0, 1, 1);
+  }
+}
+function drawFloors() {
+  X.fillStyle = '#1c2a90'; X.fillRect(4, 48, 4, 176); X.fillRect(248, 48, 4, 176);
+  X.fillStyle = '#4a60ff'; X.fillRect(4, 48, 1, 176); X.fillRect(248, 48, 1, 176);
+  for (const fy of FY) {
+    X.fillStyle = '#b83818'; X.fillRect(8, fy, 240, 8);
+    X.fillStyle = '#ff7038'; X.fillRect(8, fy, 240, 1);
+    X.fillStyle = '#5a1408'; X.fillRect(8, fy + 4, 240, 1); X.fillRect(8, fy + 7, 240, 1);
+    for (let x = 8; x < 248; x += 8) { X.fillRect(x, fy + 1, 1, 3); X.fillRect(x + 4, fy + 5, 1, 2); }
+  }
+}
+function drawLadders() {
+  for (const l of ladders) {
+    const yt = FY[l.top], yb = FY[l.bot], h = yb - yt;
+    X.fillStyle = '#30d0ff';
+    X.fillRect(l.x - 6, yt, 2, h); X.fillRect(l.x + 4, yt, 2, h);
+    for (let y = yt + 3; y < yb; y += 5) X.fillRect(l.x - 4, y, 8, 1);
+  }
+}
+function drawHUD() {
+  txt('1UP', 10, 4, '#ff4040');
+  txt(String(score).padStart(6, '0'), 10, 15, '#fff');
+  txt('HI-SCORE', 128, 4, '#ff4040', 'center');
+  txt(String(hi).padStart(6, '0'), 128, 15, '#fff', 'center');
+  txt('STAGE', 246, 4, '#3fe0ff', 'right');
+  txt(String(level).padStart(2, '0'), 246, 15, '#fff', 'right');
+  // lives
+  for (let i = 0; i < Math.min(lives - (mode === 'dying' ? 0 : 1), 6); i++) {
+    const x = 12 + i * 10, y = 228;
+    disc(x, y + 3, 3, '#b0682c');
+    X.fillStyle = '#1a1a1a'; X.fillRect(x - 3, y + 2, 7, 2);
+    X.fillStyle = '#fff'; X.fillRect(x - 1, y + 5, 3, 1);
+  }
+  // timer
+  txt('TIME', 96, 228, '#ffe94a');
+  const w = Math.round(110 * timeLeft / TMAX);
+  X.fillStyle = '#333'; X.fillRect(134, 229, 110, 6);
+  X.fillStyle = timeLeft < TMAX * 0.25 ? (frame % 20 < 10 ? '#ff3030' : '#ff9a1a') : '#40e060';
+  X.fillRect(134, 229, w, 6);
+}
+function panel(lines, y) {
+  const h = lines.length * 14 + 10;
+  X.fillStyle = 'rgba(0,0,0,.85)'; X.fillRect(40, y, 176, h);
+  X.strokeStyle = '#ff3fa4'; X.lineWidth = 1; X.strokeRect(40.5, y + 0.5, 175, h - 1);
+  lines.forEach(([s, c], i) => txt(s, 128, y + 7 + i * 14, c, 'center'));
+}
+function drawStage() {
+  drawBackdrop(); drawFloors(); drawLadders();
+  for (const s of spikes) drawSpike(s.x, FY[s.f]);
+  for (const f of fruits) if (!f.got) drawFruit(f.type, f.x, FY[f.f] - 10 + Math.sin(frame * 0.08 + f.ph) * 1.2);
+  if (pot && !pot.got) drawPot(pot.x, FY[pot.f]);
+  for (const s of snakes) spr(Math.floor(s.anim / 10) % 2 ? SNK_B : SNK_A, SNK_PAL, s.x - 8, FY[s.f] - 7, s.vx < 0);
+
+  if (mode === 'dying') {
+    if (t > 30 || frame % 6 < 3) drawRaccoon(P.x, P.y - (110 - t < 20 ? (110 - t) * 0.6 : 12), P.dir, 0, { vflip: true });
+  } else if (P.climb) {
+    drawRaccoon(P.x, P.y, Math.floor(P.anim / 8) % 2 ? 1 : -1, Math.floor(P.anim / 8) % 2, { noTail: true });
+  } else {
+    drawRaccoon(P.x, P.y, P.dir, P.air ? 1 : Math.floor(P.anim / 7) % 2);
+  }
+  for (const p of popups) txt(p.s, p.x, p.y, p.c, 'center');
+  drawHUD();
+
+  if (mode === 'ready') panel([['STAGE ' + level, '#3fe0ff'], ['READY!', frame % 30 < 20 ? '#ffe94a' : '#ff9a1a']], 104);
+  if (mode === 'clear') panel([['STAGE CLEAR!', '#40e060'], ['TIME BONUS', '#ffe94a']], 104);
+  if (mode === 'over') panel([['GAME OVER', '#ff4040'], [t === 0 ? (frame % 40 < 25 ? 'PUSH SPACE' : '') : '', '#fff']], 104);
+  if (mode === 'play' && paused) panel([['PAUSE', '#ffe94a']], 112);
+}
+function drawTitle() {
+  drawBackdrop();
+  // logo
+  const bob = Math.sin(frame * 0.06) * 2;
+  X.font = 'bold 30px "Apple SD Gothic Neo","Malgun Gothic",sans-serif';
+  X.textAlign = 'center'; X.textBaseline = 'top';
+  X.fillStyle = '#b0200a'; X.fillText('너구리', 131, 34 + bob + 3);
+  X.fillStyle = '#ffe94a'; X.fillText('너구리', 128, 34 + bob);
+  txt('DAE-MO-HEOM', 128, 72, '#ff3fa4', 'center');
+
+  // demo scene
+  X.fillStyle = '#b83818'; X.fillRect(8, 150, 240, 8);
+  X.fillStyle = '#ff7038'; X.fillRect(8, 150, 240, 1);
+  const rx = (frame * 0.9) % 300 - 20;
+  drawRaccoon(rx, 150, 1, Math.floor(frame / 7) % 2);
+  spr(Math.floor(frame / 10) % 2 ? SNK_B : SNK_A, SNK_PAL, rx - 50, 143, false);
+  drawFruit(0, 60, 115); drawFruit(1, 100, 115); drawFruit(2, 140, 115); drawFruit(3, 180, 115);
+  [100, 150, 200, 300].forEach((p, i) => txt(String(100 + i * 50), 60 + i * 40, 125, '#fff', 'center', 6));
+
+  txt('HI-SCORE ' + String(hi).padStart(6, '0'), 128, 170, '#3fe0ff', 'center');
+  if (frame % 60 < 40) txt('PUSH SPACE TO START', 128, 192, '#fff', 'center');
+  txt('ARROWS:MOVE/CLIMB', 128, 210, '#9fb8ff', 'center', 6);
+  txt('SPACE:JUMP  M:MUSIC  P:PAUSE', 128, 220, '#9fb8ff', 'center', 6);
+}
+function draw() {
+  if (mode === 'title') drawTitle(); else drawStage();
+}
+
+/* ---------------- loop ---------------- */
+let acc = 0, last = performance.now();
+function loop(now) {
+  acc += Math.min(100, now - last); last = now;
+  while (acc >= 1000 / 60) { update(); acc -= 1000 / 60; }
+  draw();
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+})();
+</script>
+</body>
+</html>
